@@ -5,15 +5,18 @@
 #include <cublas_v2.h>
 #include <mma.h>
 #include <chrono>
+
 using namespace std;
 using namespace nvcuda;
 
-// Larger warp tile: each warp computes WM x WN via more fragments,
-// reducing the number of warps needed and increasing arithmetic intensity.
-// 256x128 block tile, 256 threads (8 warps), arranged 4(m) x 2(n)
+// Gemini Optimized v6:
+// 1. Vectorized Global Memory Loads (float4) to maximize bandwidth.
+// 2. Shared Memory Padding (+8) to eliminate bank conflicts.
+// 3. True Double Buffering for latency hiding.
+
 #define BM 256
 #define BN 128
-#define BK 32
+#define BK 16
 
 #define WARPS_M 4
 #define WARPS_N 2
@@ -34,43 +37,88 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int warp_m = warp_id / WARPS_N;
   int warp_n = warp_id % WARPS_N;
 
-  __shared__ half sh_a[BK][BM];
-  __shared__ half sh_b[BK][BN];
+  // Padding (+8) to avoid shared memory bank conflicts during load_matrix_sync
+  __shared__ half sh_a[2][BK][BM + 8];
+  __shared__ half sh_b[2][BK][BN + 8];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WFRAG_M][WFRAG_N];
   for (int r = 0; r < WFRAG_M; r++)
     for (int c = 0; c < WFRAG_N; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  for (int k0 = 0; k0 < dim_k; k0 += BK) {
-    __syncthreads();
-    for (int idx = tid; idx < BK * BM; idx += NTHREADS) {
-      int kk = idx / BM;
-      int mm = idx % BM;
-      sh_a[kk][mm] = __float2half(d_a[(k0 + kk) * dim_m + block_m + mm]);
-    }
-    for (int idx = tid; idx < BK * BN; idx += NTHREADS) {
-      int kk = idx / BN;
-      int nn = idx % BN;
-      sh_b[kk][nn] = __float2half(d_b[(block_n + nn) * dim_k + k0 + kk]);
-    }
-    __syncthreads();
+  int num_k_tiles = dim_k / BK;
 
+  // Prologue: Load Stage 0 with float4 vectorized loads
+  int k0 = 0;
+  for (int i = tid; i < (BK * BM) / 4; i += NTHREADS) {
+    int col = i / (BM / 4);
+    int row4 = i % (BM / 4);
+    int row = row4 * 4;
+    float4 a_vec = reinterpret_cast<const float4*>(&d_a[(k0 + col) * dim_m + block_m + row])[0];
+    sh_a[0][col][row + 0] = __float2half(a_vec.x);
+    sh_a[0][col][row + 1] = __float2half(a_vec.y);
+    sh_a[0][col][row + 2] = __float2half(a_vec.z);
+    sh_a[0][col][row + 3] = __float2half(a_vec.w);
+  }
+  for (int i = tid; i < (BN * BK) / 4; i += NTHREADS) {
+    int col = i / (BK / 4);
+    int row4 = i % (BK / 4);
+    int row = row4 * 4;
+    float4 b_vec = reinterpret_cast<const float4*>(&d_b[(block_n + col) * dim_k + k0 + row])[0];
+    sh_b[0][row + 0][col] = __float2half(b_vec.x);
+    sh_b[0][row + 1][col] = __float2half(b_vec.y);
+    sh_b[0][row + 2][col] = __float2half(b_vec.z);
+    sh_b[0][row + 3][col] = __float2half(b_vec.w);
+  }
+  __syncthreads();
+
+  for (int t = 0; t < num_k_tiles; t++) {
+    int cur = t % 2;
+    int nxt = (t + 1) % 2;
+
+    // Prefetch next tile while computing current
+    if (t + 1 < num_k_tiles) {
+      int k_next = (t + 1) * BK;
+      for (int i = tid; i < (BK * BM) / 4; i += NTHREADS) {
+        int col = i / (BM / 4);
+        int row4 = i % (BM / 4);
+        int row = row4 * 4;
+        float4 a_vec = reinterpret_cast<const float4*>(&d_a[(k_next + col) * dim_m + block_m + row])[0];
+        sh_a[nxt][col][row + 0] = __float2half(a_vec.x);
+        sh_a[nxt][col][row + 1] = __float2half(a_vec.y);
+        sh_a[nxt][col][row + 2] = __float2half(a_vec.z);
+        sh_a[nxt][col][row + 3] = __float2half(a_vec.w);
+      }
+      for (int i = tid; i < (BN * BK) / 4; i += NTHREADS) {
+        int col = i / (BK / 4);
+        int row4 = i % (BK / 4);
+        int row = row4 * 4;
+        float4 b_vec = reinterpret_cast<const float4*>(&d_b[(block_n + col) * dim_k + k_next + row])[0];
+        sh_b[nxt][row + 0][col] = __float2half(b_vec.x);
+        sh_b[nxt][row + 1][col] = __float2half(b_vec.y);
+        sh_b[nxt][row + 2][col] = __float2half(b_vec.z);
+        sh_b[nxt][row + 3][col] = __float2half(b_vec.w);
+      }
+    }
+
+    // Compute on current stage
     for (int kk = 0; kk < BK; kk += 16) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag[WFRAG_M];
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[WFRAG_N];
+      
       for (int r = 0; r < WFRAG_M; r++) {
         int m_off = warp_m * WM + r * 16;
-        wmma::load_matrix_sync(a_frag[r], &sh_a[kk][m_off], BM);
+        wmma::load_matrix_sync(a_frag[r], &sh_a[cur][kk][m_off], BM + 8); // Padded stride
       }
       for (int c = 0; c < WFRAG_N; c++) {
         int n_off = warp_n * WN + c * 16;
-        wmma::load_matrix_sync(b_frag[c], &sh_b[kk][n_off], BN);
+        wmma::load_matrix_sync(b_frag[c], &sh_b[cur][kk][n_off], BN + 8); // Padded stride
       }
       for (int r = 0; r < WFRAG_M; r++)
         for (int c = 0; c < WFRAG_N; c++)
           wmma::mma_sync(acc[r][c], a_frag[r], b_frag[c], acc[r][c]);
     }
+    __syncthreads();
   }
 
   for (int r = 0; r < WFRAG_M; r++) {
